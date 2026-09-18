@@ -2,12 +2,13 @@ pipeline {
     agent any
 
     environment {
-        AWS_REGION = 'us-east-1'
-        AWS_ACCOUNT_ID = '659161126002'
-        ECR_REPOSITORY = 'ecs-cicd'
-        ECS_CLUSTER = 'ecs-cicd-cluster'
-        ECS_SERVICE = 'ecs-cicd-service'
+        AWS_REGION      = 'us-east-1'
+        AWS_ACCOUNT_ID  = '659161126002'
+        ECR_REPOSITORY  = 'ecs-cicd'
+        ECS_CLUSTER     = 'ecs-cicd-cluster'
+        ECS_SERVICE     = 'ecs-cicd-service'
         ECS_TASK_FAMILY = 'ecs-cicd'
+
         IMAGE_TAG = "build-${BUILD_NUMBER}"
         IMAGE_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:build-${BUILD_NUMBER}"
     }
@@ -23,9 +24,7 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 sh '''
-                    docker build \
-                      -t ${ECR_REPOSITORY}:${IMAGE_TAG} \
-                      "/mnt/c/Users/skid0/Project 2/cicd-wordpress"
+                    docker build -t ${ECR_REPOSITORY}:${IMAGE_TAG} .
                 '''
             }
         }
@@ -48,13 +47,10 @@ pipeline {
             }
         }
 
-        stage('Push Image') {
+        stage('Push Image to ECR') {
             steps {
                 sh '''
-                    docker tag \
-                      ${ECR_REPOSITORY}:${IMAGE_TAG} \
-                      ${IMAGE_URI}
-
+                    docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${IMAGE_URI}
                     docker push ${IMAGE_URI}
                 '''
             }
@@ -69,36 +65,55 @@ pipeline {
                     sh '''
                         echo "Deploying ${IMAGE_URI}"
 
-                        aws ecs describe-task-definition \
-                          --task-definition ${ECS_TASK_FAMILY} \
+                        EXECUTION_ROLE_ARN=$(aws iam get-role \
+                          --role-name ecs-cicd-ecs-execution-role \
                           --region ${AWS_REGION} \
-                          --query taskDefinition > task-definition.json
+                          --query 'Role.Arn' \
+                          --output text)
 
-                        python3 - <<'PY'
-import json
-
-with open("task-definition.json") as f:
-    task = json.load(f)
-
-for container in task["containerDefinitions"]:
-    if container["name"] == "ecs-cicd":
-        container["image"] = "${IMAGE_URI}"
-
-for key in [
-    "taskDefinitionArn",
-    "revision",
-    "status",
-    "requiresAttributes",
-    "compatibilities"
-]:
-    task.pop(key, None)
-
-with open("new-task-definition.json", "w") as f:
-    json.dump(task, f)
-PY
+                        cat > container-definitions.json <<EOF
+[
+  {
+    "name": "ecs-cicd",
+    "image": "${IMAGE_URI}",
+    "essential": true,
+    "portMappings": [
+      {
+        "containerPort": 80,
+        "hostPort": 80,
+        "protocol": "tcp"
+      }
+    ],
+    "healthCheck": {
+      "command": [
+        "CMD-SHELL",
+        "wget -q -O - http://localhost/ || exit 1"
+      ],
+      "interval": 30,
+      "timeout": 5,
+      "retries": 3,
+      "startPeriod": 10
+    },
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/ecs/ecs-cicd",
+        "awslogs-region": "${AWS_REGION}",
+        "awslogs-stream-prefix": "ecs"
+      }
+    }
+  }
+]
+EOF
 
                         TASK_REVISION=$(aws ecs register-task-definition \
-                          --cli-input-json file://new-task-definition.json \
+                          --family ${ECS_TASK_FAMILY} \
+                          --execution-role-arn ${EXECUTION_ROLE_ARN} \
+                          --network-mode awsvpc \
+                          --requires-compatibilities FARGATE \
+                          --cpu 256 \
+                          --memory 512 \
+                          --container-definitions file://container-definitions.json \
                           --region ${AWS_REGION} \
                           --query 'taskDefinition.revision' \
                           --output text)
@@ -110,6 +125,8 @@ PY
                           --service ${ECS_SERVICE} \
                           --task-definition ${ECS_TASK_FAMILY}:${TASK_REVISION} \
                           --region ${AWS_REGION}
+
+                        echo "Waiting for ECS service to stabilize..."
 
                         aws ecs wait services-stable \
                           --cluster ${ECS_CLUSTER} \
@@ -125,7 +142,7 @@ PY
 
     post {
         always {
-            sh 'rm -f task-definition.json new-task-definition.json'
+            sh 'rm -f container-definitions.json'
         }
     }
 }
